@@ -1,25 +1,21 @@
-FROM vllm/vllm-openai:latest
+FROM python:3.10-slim
 
-USER root
+# Устанавливаем только poppler-utils (для pdf2image) и базовую библиотеку для OpenCV
 RUN apt-get update && apt-get install -y \
     poppler-utils \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn \
-    python-multipart \
-    pdf2image \
-    requests \
-    aiohttp
-
-RUN pip install opencv-python-headless
 
 WORKDIR /app
 
+# Устанавливаем зависимости (убедитесь, что opencv-python-headless в списке)
+RUN pip install --no-cache-dir \
+    fastapi uvicorn python-multipart \
+    pypdf pdf2image Pillow \
+    aiohttp tqdm opencv-python-headless
+
+# Копируем код
 COPY app.py .
-COPY start.sh .
 
-RUN chmod +x start.sh
-
-ENTRYPOINT ["./start.sh"]
+# Запускаем с --reload для мгновенного подхвата изменений в коде
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8506", "--reload"]

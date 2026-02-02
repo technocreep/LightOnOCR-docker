@@ -1,14 +1,14 @@
 services:
-  ocr-service:
-    build: ./service
-    container_name: lighton_ocr
-    ports:
-      - "8506:8506"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
+  vllm-server:
+    image: vllm/vllm-openai:latest
+    container_name: ocr_back_vllm
     environment:
       - CUDA_VISIBLE_DEVICES=0
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - HF_TOKEN=${HF_TOKEN}
+    ports:
+      - "8507:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
     deploy:
       resources:
         reservations:
@@ -17,3 +17,22 @@ services:
               device_ids: ['0']
               capabilities: [gpu]
     shm_size: '8gb'
+    command: >
+          --model lightonai/LightOnOCR-1B-1025
+          --port 8000
+          --trust-remote-code
+          --limit-mm-per-prompt '{"image": 1}'
+          --gpu-memory-utilization 0.2
+
+  ocr-app:
+    build: ./service
+    container_name: fastapi_ocr_frontend
+    ports:
+      - "8506:8506"
+    environment:
+      - VLLM_URL=http://vllm-server:8000/v1/chat/completions
+    volumes:
+      - ./service:/app
+      - ./output_texts:/app/output_texts
+    depends_on:
+      - vllm-server
