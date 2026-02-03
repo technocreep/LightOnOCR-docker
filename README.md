@@ -2,6 +2,16 @@
 
 A containerized FastAPI service for LightOnOCR-1B-1025 model with Docker Compose orchestration. This project provides a high-performance OCR (Optical Character Recognition) service with parallel processing capabilities for PDF documents.
 
+## Usage with open-webUI
+
+Got to Admin Panel/Settings/Documents
+
+Set **Content Extraction Engine** to **Mistral OCR**
+
+Under it: 
+http://0.0.0.0:8509/v1 (or another port as in dockerfile)
+and any symbols in key - without it it will not work
+
 ## Overview
 
 This project deploys the LightOnOCR-1B-1025 model using a two-service architecture with Docker Compose:
