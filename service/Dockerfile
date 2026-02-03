@@ -18,4 +18,4 @@ RUN pip install --no-cache-dir \
 COPY app.py .
 
 # Запускаем с --reload для мгновенного подхвата изменений в коде
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8506", "--reload"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8509", "--reload"]

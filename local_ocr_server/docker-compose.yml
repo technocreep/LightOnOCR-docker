@@ -1,0 +1,21 @@
+services:
+  local-ocr:
+    build:
+      context: .
+    container_name: local-ocr
+    ports:
+      - "8088:8080"
+    environment:
+      # Auth is not enforced by this server (Authorization header is accepted but ignored)
+      # OCR languages for EasyOCR, comma-separated (e.g. "en,ru")
+      OCR_LANGS: "en"
+      # auto|true|false
+      OCR_GPU: "auto"
+      # PDF rendering DPI for OCR pages
+      PDF_RENDER_DPI: "200"
+    volumes:
+      # Persist EasyOCR downloaded models between container recreations
+      - ./easyocr-cache:/root/.EasyOCR
+    # For Docker Compose v2+: enables NVIDIA GPUs
+    gpus: all
+    restart: unless-stopped
