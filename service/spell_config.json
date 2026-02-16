@@ -1,0 +1,43 @@
+{
+  "whitelist": ["россыпь","россыпной","россыпям","россыпях","россыпей","аллювий","аллювия"],
+  "whitelist_extra": ["Матычак","Элканский"],
+  "seed_dictionary_entries": {
+    "россыпь": 5000000,
+    "россыпной": 2000000,
+    "россыпям": 1000000,
+    "россыпях": 1000000,
+    "россыпей": 1000000
+  },
+  "no_fix_prefixes": ["вулкано","топографо","географо"],
+  "block_if_contains": [
+    "литолог","вулкан","кристалл","аллюв","андезит","страти","петр","геолог","магнет","метаморф",
+    "гранит","диорит","гнейс","сланец","скарн","флюид","минерал","логич","генн","графич",
+    "топограф","маркшей","эфель","делюв","пролюв","увал"
+  ],
+  "block_rules": [
+    {
+      "src_lemma_prefix": "росс",
+      "require_src_chars": "пы",
+      "require_candidate_chars": "пы",
+      "min_common_prefix": 2,
+      "max_len_delta": 2
+    }
+  ],
+  "allow_rules": [
+    {
+      "src_lemma_prefix": "росс",
+      "candidate_lemma_prefix": "россып",
+      "min_common_prefix": 3,
+      "max_len_delta": 3
+    }
+  ],
+  "params": {
+    "min_candidate_count": 50,
+    "max_edit_distance_lookup": 2,
+    "require_prefix_chars": 1,
+    "max_len_delta": 3,
+    "require_same_pos": true,
+    "spell_min_word_len": 4,
+    "skip_titlecase": true
+  }
+}
