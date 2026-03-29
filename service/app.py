@@ -7,6 +7,7 @@ import logging
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 import cv2
@@ -27,15 +28,118 @@ logger = logging.getLogger("ocr-app")
 
 app = FastAPI()
 
-VLLM_URL = os.getenv("VLLM_URL", "http://vllm-server:8001/v1/chat/completions")
+VLLM_URL = os.getenv("VLLM_URL", "http://vllm-server:8099/v1/chat/completions")
 MODEL_NAME = "lightonai/LightOnOCR-1B-1025"
 OUTPUT_DIR = Path("./output_texts")
 
-PDF_DPI = 200
-SAVE_QUALITY = 90
-MAX_CONCURRENT_REQUESTS = 8
+PDF_DPI = max(72, int(os.getenv("PDF_DPI", "144")))
+SAVE_QUALITY = max(40, min(95, int(os.getenv("SAVE_QUALITY", "80"))))
+OCR_MAX_TOKENS = max(128, int(os.getenv("OCR_MAX_TOKENS", "1024")))
+OCR_PROCESSING_MODE = os.getenv("OCR_PROCESSING_MODE", "sequential").strip().lower()
+MAX_CONCURRENT_REQUESTS = max(1, int(os.getenv("MAX_CONCURRENT_REQUESTS", "1")))
+OCR_CONVERT_WORKERS = max(1, int(os.getenv("OCR_CONVERT_WORKERS", "1")))
+OCR_MODEL_CONNECT_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_CONNECT_TIMEOUT_SECONDS", "120"))
+OCR_MODEL_READ_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_READ_TIMEOUT_SECONDS", "21600"))
+OCR_MODEL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_TOTAL_TIMEOUT_SECONDS", "21600"))
+VLLM_RETRY_ATTEMPTS = max(1, int(os.getenv("VLLM_RETRY_ATTEMPTS", "10")))
+VLLM_RETRY_DELAY_SECONDS = float(os.getenv("VLLM_RETRY_DELAY_SECONDS", "5"))
+VLLM_STARTUP_MAX_WAIT_SECONDS = float(os.getenv("VLLM_STARTUP_MAX_WAIT_SECONDS", "1800"))
+VLLM_HEALTHCHECK_TIMEOUT_SECONDS = float(os.getenv("VLLM_HEALTHCHECK_TIMEOUT_SECONDS", "10"))
 
-executor = ThreadPoolExecutor(max_workers=8)
+executor = ThreadPoolExecutor(max_workers=OCR_CONVERT_WORKERS)
+
+
+def _build_client_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(
+        total=OCR_MODEL_TOTAL_TIMEOUT_SECONDS,
+        connect=OCR_MODEL_CONNECT_TIMEOUT_SECONDS,
+        sock_connect=OCR_MODEL_CONNECT_TIMEOUT_SECONDS,
+        sock_read=OCR_MODEL_READ_TIMEOUT_SECONDS,
+    )
+
+
+def _use_sequential_processing() -> bool:
+    return OCR_PROCESSING_MODE != "parallel" or MAX_CONCURRENT_REQUESTS == 1
+
+
+def _build_vllm_health_url() -> str:
+    parts = urlsplit(VLLM_URL)
+    return urlunsplit((parts.scheme, parts.netloc, "/health", "", ""))
+
+
+async def _wait_for_vllm_ready() -> None:
+    deadline = time.time() + VLLM_STARTUP_MAX_WAIT_SECONDS
+    health_url = _build_vllm_health_url()
+    timeout = aiohttp.ClientTimeout(
+        total=VLLM_HEALTHCHECK_TIMEOUT_SECONDS,
+        connect=VLLM_HEALTHCHECK_TIMEOUT_SECONDS,
+        sock_connect=VLLM_HEALTHCHECK_TIMEOUT_SECONDS,
+        sock_read=VLLM_HEALTHCHECK_TIMEOUT_SECONDS,
+    )
+
+    attempt = 0
+    last_error = "unknown error"
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(health_url) as resp:
+                    if resp.status < 500:
+                        logger.info("vLLM is ready at %s", health_url)
+                        return
+                    last_error = f"HTTP {resp.status}"
+        except Exception as exc:
+            last_error = str(exc)
+
+        logger.warning(
+            "Waiting for vLLM at %s (attempt %s, last error: %s)",
+            health_url,
+            attempt,
+            last_error,
+        )
+        await asyncio.sleep(VLLM_RETRY_DELAY_SECONDS)
+
+    raise RuntimeError(f"vLLM did not become ready at {health_url}: {last_error}")
+
+
+async def _post_to_vllm(session: aiohttp.ClientSession, payload: Dict[str, Any]) -> Dict[str, Any]:
+    last_exception: Exception | None = None
+    last_status_error = ""
+
+    for attempt in range(1, VLLM_RETRY_ATTEMPTS + 1):
+        try:
+            async with session.post(VLLM_URL, json=payload) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+
+                last_status_error = await resp.text()
+                if resp.status not in {502, 503, 504} or attempt == VLLM_RETRY_ATTEMPTS:
+                    raise HTTPException(status_code=502, detail=f"vLLM OCR failed: {last_status_error}")
+
+                logger.warning(
+                    "vLLM temporary HTTP error %s on attempt %s/%s: %s",
+                    resp.status,
+                    attempt,
+                    VLLM_RETRY_ATTEMPTS,
+                    last_status_error,
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_exception = exc
+            logger.warning(
+                "vLLM connection attempt %s/%s failed: %s",
+                attempt,
+                VLLM_RETRY_ATTEMPTS,
+                exc,
+            )
+
+        if attempt < VLLM_RETRY_ATTEMPTS:
+            await asyncio.sleep(VLLM_RETRY_DELAY_SECONDS)
+
+    if last_exception is not None:
+        raise HTTPException(status_code=502, detail=f"vLLM connection failed after retries: {last_exception}")
+    raise HTTPException(status_code=502, detail=f"vLLM OCR failed after retries: {last_status_error}")
 
 
 # --- Mistral OCR API compatibility (OpenWebUI mistral_ocr loader) ---
@@ -89,14 +193,21 @@ async def _ocr_pdf_bytes_to_pages(content: bytes, doc_name: str, total_pages: in
     target_dir = OUTPUT_DIR / "mistral" / doc_name / "images"
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    timeout = aiohttp.ClientTimeout(total=3600)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    timeout = _build_client_timeout()
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = [
-            convert_and_ocr_page(session, semaphore, content, page_num, target_dir, total_pages)
-            for page_num in range(1, total_pages + 1)
-        ]
-        results = await asyncio.gather(*tasks)
+        if _use_sequential_processing():
+            results = []
+            for page_num in range(1, total_pages + 1):
+                results.append(
+                    await convert_and_ocr_page(session, None, content, page_num, target_dir, total_pages)
+                )
+        else:
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+            tasks = [
+                convert_and_ocr_page(session, semaphore, content, page_num, target_dir, total_pages)
+                for page_num in range(1, total_pages + 1)
+            ]
+            results = await asyncio.gather(*tasks)
 
     results.sort(key=lambda x: x[0])
     return [{"index": page_num - 1, "markdown": text} for page_num, text in results]
@@ -122,16 +233,12 @@ async def _ocr_image_bytes_to_pages(content: bytes) -> List[Dict[str, Any]]:
                 ],
             }
         ],
-        "max_tokens": 2048,
+        "max_tokens": OCR_MAX_TOKENS,
     }
 
-    timeout = aiohttp.ClientTimeout(total=3600)
+    timeout = _build_client_timeout()
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(VLLM_URL, json=payload) as resp:
-            if resp.status != 200:
-                err_text = await resp.text()
-                raise HTTPException(status_code=502, detail=f"vLLM OCR failed: {err_text}")
-            result = await resp.json()
+        result = await _post_to_vllm(session, payload)
 
     text = (result.get("choices") or [{}])[0].get("message", {}).get("content")
     return [{"index": 0, "markdown": text or ""}]
@@ -263,14 +370,14 @@ def convert_page_sync(content, page_num, target_dir):
 
 async def process_single_page(session, semaphore, img_path, page_num):
     """Send single page to vLLM"""
-    async with semaphore:
+    async def _run_request():
         start = time.time()
         try:
             prep_start = time.time()
             with Image.open(img_path) as img:
                 b64_image = preprocess_image_for_ocr(img)
             print(f'[Page {page_num}] Image preprocessing took {time.time()-prep_start:.2f}s', flush=True)
-            
+
             payload = {
                 "model": MODEL_NAME,
                 "messages": [{
@@ -280,29 +387,30 @@ async def process_single_page(session, semaphore, img_path, page_num):
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
                     ]
                 }],
-                "max_tokens": 2048
+                "max_tokens": OCR_MAX_TOKENS
             }
 
             req_start = time.time()
-            async with session.post(VLLM_URL, json=payload) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
-                    elapsed = time.time() - start
-                    req_time = time.time() - req_start
-                    print(f'[Page {page_num}] ✓ OCR request took {req_time:.2f}s, total OCR: {elapsed:.2f}s', flush=True)
-                    return (page_num, result['choices'][0]['message']['content'])
-                else:
-                    err_text = await resp.text()
-                    return (page_num, f"[Error page {page_num}: {err_text}]")
+            result = await _post_to_vllm(session, payload)
+            elapsed = time.time() - start
+            req_time = time.time() - req_start
+            print(f'[Page {page_num}] ✓ OCR request took {req_time:.2f}s, total OCR: {elapsed:.2f}s', flush=True)
+            return (page_num, result['choices'][0]['message']['content'])
         except Exception as e:
             elapsed = time.time() - start
             print(f'[Page {page_num}] ✗ Exception after {elapsed:.2f}s: {str(e)}', flush=True)
             return (page_num, f"[Exception page {page_num}: {str(e)}]")
 
+    if semaphore is None:
+        return await _run_request()
+
+    async with semaphore:
+        return await _run_request()
+
 async def convert_and_ocr_page(session, semaphore, content, page_num, target_dir, total_pages):
     """Convert page then sand to OCR"""
     page_start = time.time()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     
     print(f'[Page {page_num}/{total_pages}] ⏳ Starting conversion...', flush=True)
     conv_start = time.time()
@@ -345,24 +453,35 @@ async def ocr_pdf(file: UploadFile = File(...)):
     
     print(f'\n{"="*80}')
     print(f'📄 PDF: {file.filename} | Pages: {total_pages}')
-    print(f'🔧 Max concurrent OCR requests: {MAX_CONCURRENT_REQUESTS}')
+    mode_label = "sequential" if _use_sequential_processing() else f"parallel ({MAX_CONCURRENT_REQUESTS})"
+    print(f'🔧 OCR request mode: {mode_label}')
     print(f'{"="*80}\n', flush=True)
 
-    timeout = aiohttp.ClientTimeout(total=3600)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    
+    timeout = _build_client_timeout()
+
     tasks_start = time.time()
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = [
-            convert_and_ocr_page(session, semaphore, content, page_num, target_dir, total_pages)
-            for page_num in range(1, total_pages + 1)
-        ]
-        
-        print(f'⚡ All {len(tasks)} tasks created in {time.time()-tasks_start:.2f}s, starting parallel execution...\n', flush=True)
-        
-        gather_start = time.time()
-        results = await asyncio.gather(*tasks)
-        gather_time = time.time() - gather_start
+        if _use_sequential_processing():
+            print(f'⚡ Starting sequential processing for {total_pages} pages...\n', flush=True)
+            gather_start = time.time()
+            results = []
+            for page_num in range(1, total_pages + 1):
+                results.append(
+                    await convert_and_ocr_page(session, None, content, page_num, target_dir, total_pages)
+                )
+            gather_time = time.time() - gather_start
+        else:
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+            tasks = [
+                convert_and_ocr_page(session, semaphore, content, page_num, target_dir, total_pages)
+                for page_num in range(1, total_pages + 1)
+            ]
+
+            print(f'⚡ All {len(tasks)} tasks created in {time.time()-tasks_start:.2f}s, starting parallel execution...\n', flush=True)
+
+            gather_start = time.time()
+            results = await asyncio.gather(*tasks)
+            gather_time = time.time() - gather_start
 
     results.sort(key=lambda x: x[0])
     full_text = "\n\n--- Page Break ---\n\n".join([text for _, text in results])
@@ -379,6 +498,11 @@ async def ocr_pdf(file: UploadFile = File(...)):
     print(f'{"="*80}\n', flush=True)
     
     return {"filename": file.filename, "text": full_text, "processing_time": total_time}
+
+
+@app.on_event("startup")
+async def startup_event():
+    await _wait_for_vllm_ready()
 
 @app.on_event("shutdown")
 async def shutdown_event():

@@ -1,7 +1,9 @@
 services:
-  vllm-server_1:
+  vllm-server:
     image: vllm/vllm-openai:latest
-    container_name: ocr_back_vllm_balabanov
+    #container_name: ocr_back_vllm_balabanov
+    hostname: vllm-server
+    restart: unless-stopped
     environment:
       - CUDA_VISIBLE_DEVICES=0
       - HF_TOKEN=${HF_TOKEN}
@@ -17,22 +19,44 @@ services:
               device_ids: ['0']
               capabilities: [gpu]
     shm_size: '8gb'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
     command: >
           --model lightonai/LightOnOCR-1B-1025
           --port 8099
           --trust-remote-code
           --limit-mm-per-prompt '{"image": 1}'
-          --gpu-memory-utilization 0.2
+          --gpu-memory-utilization 0.6
 
-  ocr-app_1:
+  ocr-app:
     build: ./service
+    hostname: ocr-app
     container_name: fastapi_ocr_frontend_balabanov
+    restart: unless-stopped
     ports:
       - "8509:8509"
     environment:
-      - VLLM_URL=http://vllm-server_1:8099/v1/chat/completions
+      - VLLM_URL=http://vllm-server:8099/v1/chat/completions
+      - PDF_DPI=144
+      - SAVE_QUALITY=80
+      - OCR_MAX_TOKENS=1024
+      - OCR_PROCESSING_MODE=sequential
+      - MAX_CONCURRENT_REQUESTS=1
+      - OCR_CONVERT_WORKERS=1
+      - OCR_MODEL_CONNECT_TIMEOUT_SECONDS=300
+      - OCR_MODEL_READ_TIMEOUT_SECONDS=21600
+      - OCR_MODEL_TOTAL_TIMEOUT_SECONDS=21600
+      - VLLM_RETRY_ATTEMPTS=20
+      - VLLM_RETRY_DELAY_SECONDS=10
+      - VLLM_STARTUP_MAX_WAIT_SECONDS=3600
+      - VLLM_HEALTHCHECK_TIMEOUT_SECONDS=10
     volumes:
       - ./service:/app
       - ./output_texts:/app/output_texts
     depends_on:
-      - vllm-server_1
+      vllm-server:
+        condition: service_healthy

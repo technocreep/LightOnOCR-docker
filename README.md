@@ -101,7 +101,12 @@ Key parameters:
 
 - **PDF_DPI**: Resolution for PDF conversion (default: 200)
 - **SAVE_QUALITY**: JPEG quality for saved images (default: 90)
-- **MAX_CONCURRENT_REQUESTS**: Number of parallel OCR requests (default: 8)
+- **OCR_PROCESSING_MODE**: OCR page processing mode: `sequential` or `parallel` (default: `sequential`)
+- **MAX_CONCURRENT_REQUESTS**: Number of parallel OCR requests when `OCR_PROCESSING_MODE=parallel` (default: 1)
+- **OCR_CONVERT_WORKERS**: Number of PDF page conversion worker threads (default: 1)
+- **OCR_MODEL_CONNECT_TIMEOUT_SECONDS**: Connection timeout to vLLM (default: 120)
+- **OCR_MODEL_READ_TIMEOUT_SECONDS**: Socket read timeout for long OCR jobs (default: 21600)
+- **OCR_MODEL_TOTAL_TIMEOUT_SECONDS**: Overall timeout for a single request to vLLM (default: 21600)
 - **VLLM_URL**: URL of the vLLM inference server (default: `http://vllm-server:8000/v1/chat/completions`)
 - **OUTPUT_DIR**: Directory for saving processed outputs (default: `./output_texts`)
 
@@ -233,7 +238,10 @@ The ocr-app service runs with `--reload` flag, which means:
 
 ## Performance Tips
 
-- **Parallel Processing**: Adjust `MAX_CONCURRENT_REQUESTS` in app.py (default: 8)
+- **Sequential Processing**: Default mode is `OCR_PROCESSING_MODE=sequential`
+  - Better for large files and weaker GPUs
+  - Sends OCR requests to the model one by one instead of stacking them in parallel
+- **Parallel Processing**: If needed, set `OCR_PROCESSING_MODE=parallel` and increase `MAX_CONCURRENT_REQUESTS`
   - Higher values = faster processing but more GPU memory usage
   - Lower values = slower but more stable on limited GPU memory
 - **GPU Memory**: Adjust `--gpu-memory-utilization` in docker-compose.yml (default: 0.2)
