@@ -30,7 +30,7 @@ services:
           --port 8099
           --trust-remote-code
           --limit-mm-per-prompt '{"image": 1}'
-          --gpu-memory-utilization 0.6
+          --gpu-memory-utilization 0.4
 
   ocr-app:
     build: ./service
@@ -46,7 +46,8 @@ services:
       - OCR_MAX_TOKENS=1024
       - OCR_PROCESSING_MODE=sequential
       - MAX_CONCURRENT_REQUESTS=1
-      - OCR_CONVERT_WORKERS=1
+      - OCR_CONVERT_WORKERS=2
+      - OCR_PAGE_PIPELINE_DEPTH=3
       - OCR_MODEL_CONNECT_TIMEOUT_SECONDS=300
       - OCR_MODEL_READ_TIMEOUT_SECONDS=21600
       - OCR_MODEL_TOTAL_TIMEOUT_SECONDS=21600
@@ -58,5 +59,4 @@ services:
       - ./service:/app
       - ./output_texts:/app/output_texts
     depends_on:
-      vllm-server:
-        condition: service_healthy
+      - vllm-server

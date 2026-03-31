@@ -38,6 +38,10 @@ OCR_MAX_TOKENS = max(128, int(os.getenv("OCR_MAX_TOKENS", "1024")))
 OCR_PROCESSING_MODE = os.getenv("OCR_PROCESSING_MODE", "sequential").strip().lower()
 MAX_CONCURRENT_REQUESTS = max(1, int(os.getenv("MAX_CONCURRENT_REQUESTS", "1")))
 OCR_CONVERT_WORKERS = max(1, int(os.getenv("OCR_CONVERT_WORKERS", "1")))
+OCR_PAGE_PIPELINE_DEPTH = max(
+    1,
+    int(os.getenv("OCR_PAGE_PIPELINE_DEPTH", str(max(2, OCR_CONVERT_WORKERS + MAX_CONCURRENT_REQUESTS)))),
+)
 OCR_MODEL_CONNECT_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_CONNECT_TIMEOUT_SECONDS", "120"))
 OCR_MODEL_READ_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_READ_TIMEOUT_SECONDS", "21600"))
 OCR_MODEL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_TOTAL_TIMEOUT_SECONDS", "21600"))
@@ -60,6 +64,10 @@ def _build_client_timeout() -> aiohttp.ClientTimeout:
 
 def _use_sequential_processing() -> bool:
     return OCR_PROCESSING_MODE != "parallel" or MAX_CONCURRENT_REQUESTS == 1
+
+
+def _effective_pipeline_depth(total_pages: int) -> int:
+    return max(1, min(total_pages, OCR_PAGE_PIPELINE_DEPTH))
 
 
 def _build_vllm_health_url() -> str:
@@ -195,22 +203,51 @@ async def _ocr_pdf_bytes_to_pages(content: bytes, doc_name: str, total_pages: in
 
     timeout = _build_client_timeout()
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        if _use_sequential_processing():
-            results = []
-            for page_num in range(1, total_pages + 1):
-                results.append(
-                    await convert_and_ocr_page(session, None, content, page_num, target_dir, total_pages)
-                )
-        else:
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-            tasks = [
-                convert_and_ocr_page(session, semaphore, content, page_num, target_dir, total_pages)
-                for page_num in range(1, total_pages + 1)
-            ]
-            results = await asyncio.gather(*tasks)
+        results = await _run_pdf_page_pipeline(session, content, target_dir, total_pages)
 
     results.sort(key=lambda x: x[0])
     return [{"index": page_num - 1, "markdown": text} for page_num, text in results]
+
+
+async def _run_pdf_page_pipeline(
+    session: aiohttp.ClientSession,
+    content: bytes,
+    target_dir: Path,
+    total_pages: int,
+) -> List[tuple[int, str]]:
+    semaphore = None if _use_sequential_processing() else asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    pipeline_depth = _effective_pipeline_depth(total_pages)
+
+    in_flight: Dict[asyncio.Task, int] = {}
+    results: List[tuple[int, str]] = []
+    next_page = 1
+
+    while next_page <= total_pages and len(in_flight) < pipeline_depth:
+        task = asyncio.create_task(
+            convert_and_ocr_page(session, semaphore, content, next_page, target_dir, total_pages)
+        )
+        in_flight[task] = next_page
+        next_page += 1
+
+    while in_flight:
+        done, _ = await asyncio.wait(in_flight.keys(), return_when=asyncio.FIRST_COMPLETED)
+
+        for task in done:
+            page_num = in_flight.pop(task)
+            try:
+                results.append(await task)
+            except Exception as e:
+                logger.exception("Pipeline task failed for page %s", page_num)
+                results.append((page_num, f"[Exception page {page_num}: {e}]"))
+
+            if next_page <= total_pages:
+                next_task = asyncio.create_task(
+                    convert_and_ocr_page(session, semaphore, content, next_page, target_dir, total_pages)
+                )
+                in_flight[next_task] = next_page
+                next_page += 1
+
+    return results
 
 
 async def _ocr_image_bytes_to_pages(content: bytes) -> List[Dict[str, Any]]:
@@ -455,33 +492,21 @@ async def ocr_pdf(file: UploadFile = File(...)):
     print(f'📄 PDF: {file.filename} | Pages: {total_pages}')
     mode_label = "sequential" if _use_sequential_processing() else f"parallel ({MAX_CONCURRENT_REQUESTS})"
     print(f'🔧 OCR request mode: {mode_label}')
+    print(f'📦 Page pipeline depth: {_effective_pipeline_depth(total_pages)}')
     print(f'{"="*80}\n', flush=True)
 
     timeout = _build_client_timeout()
 
     tasks_start = time.time()
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        if _use_sequential_processing():
-            print(f'⚡ Starting sequential processing for {total_pages} pages...\n', flush=True)
-            gather_start = time.time()
-            results = []
-            for page_num in range(1, total_pages + 1):
-                results.append(
-                    await convert_and_ocr_page(session, None, content, page_num, target_dir, total_pages)
-                )
-            gather_time = time.time() - gather_start
-        else:
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-            tasks = [
-                convert_and_ocr_page(session, semaphore, content, page_num, target_dir, total_pages)
-                for page_num in range(1, total_pages + 1)
-            ]
-
-            print(f'⚡ All {len(tasks)} tasks created in {time.time()-tasks_start:.2f}s, starting parallel execution...\n', flush=True)
-
-            gather_start = time.time()
-            results = await asyncio.gather(*tasks)
-            gather_time = time.time() - gather_start
+        mode_name = "bounded sequential" if _use_sequential_processing() else f"bounded parallel ({MAX_CONCURRENT_REQUESTS})"
+        print(
+            f'⚡ Starting {mode_name} processing for {total_pages} pages with pipeline depth {_effective_pipeline_depth(total_pages)}...\n',
+            flush=True,
+        )
+        gather_start = time.time()
+        results = await _run_pdf_page_pipeline(session, content, target_dir, total_pages)
+        gather_time = time.time() - gather_start
 
     results.sort(key=lambda x: x[0])
     full_text = "\n\n--- Page Break ---\n\n".join([text for _, text in results])
