@@ -31,10 +31,15 @@ app = FastAPI()
 VLLM_URL = os.getenv("VLLM_URL", "http://vllm-server:8099/v1/chat/completions")
 MODEL_NAME = "lightonai/LightOnOCR-1B-1025"
 OUTPUT_DIR = Path("./output_texts")
+OCR_EXTRACTION_PROMPT = (
+    "Extract all visible text from the image, including tables, captions, headers, footers, "
+    "and small text near images. Do not omit any text. Preserve reading order and table "
+    "contents. Output only extracted text."
+)
 
-PDF_DPI = max(72, int(os.getenv("PDF_DPI", "144")))
-SAVE_QUALITY = max(40, min(95, int(os.getenv("SAVE_QUALITY", "80"))))
-OCR_MAX_TOKENS = max(128, int(os.getenv("OCR_MAX_TOKENS", "1024")))
+PDF_DPI = max(220, int(os.getenv("PDF_DPI", "144")))
+SAVE_QUALITY = max(95, min(95, int(os.getenv("SAVE_QUALITY", "80"))))
+OCR_MAX_TOKENS = max(7000, int(os.getenv("OCR_MAX_TOKENS", "1024")))
 OCR_PROCESSING_MODE = os.getenv("OCR_PROCESSING_MODE", "sequential").strip().lower()
 MAX_CONCURRENT_REQUESTS = max(1, int(os.getenv("MAX_CONCURRENT_REQUESTS", "1")))
 OCR_CONVERT_WORKERS = max(1, int(os.getenv("OCR_CONVERT_WORKERS", "1")))
@@ -42,6 +47,14 @@ OCR_PAGE_PIPELINE_DEPTH = max(
     1,
     int(os.getenv("OCR_PAGE_PIPELINE_DEPTH", str(max(2, OCR_CONVERT_WORKERS + MAX_CONCURRENT_REQUESTS)))),
 )
+OCR_SIDEWAYS_PROJECTION_RATIO = float(os.getenv("OCR_SIDEWAYS_PROJECTION_RATIO", "1.2"))
+OCR_SPREAD_CENTER_BAND_RATIO = float(os.getenv("OCR_SPREAD_CENTER_BAND_RATIO", "0.18"))
+OCR_TEXT_MIN_DENSITY = float(os.getenv("OCR_TEXT_MIN_DENSITY", "0.015"))
+OCR_SPLIT_GAP_RATIO = float(os.getenv("OCR_SPLIT_GAP_RATIO", "0.02"))
+OCR_SEPARATOR_BAND_RATIO = float(os.getenv("OCR_SEPARATOR_BAND_RATIO", "0.025"))
+OCR_SEPARATOR_NEIGHBOR_BAND_RATIO = float(os.getenv("OCR_SEPARATOR_NEIGHBOR_BAND_RATIO", "0.06"))
+OCR_SEPARATOR_DENSITY_RATIO = float(os.getenv("OCR_SEPARATOR_DENSITY_RATIO", "0.6"))
+OCR_SEPARATOR_TEXTURE_RATIO = float(os.getenv("OCR_SEPARATOR_TEXTURE_RATIO", "0.75"))
 OCR_MODEL_CONNECT_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_CONNECT_TIMEOUT_SECONDS", "120"))
 OCR_MODEL_READ_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_READ_TIMEOUT_SECONDS", "21600"))
 OCR_MODEL_TOTAL_TIMEOUT_SECONDS = float(os.getenv("OCR_MODEL_TOTAL_TIMEOUT_SECONDS", "21600"))
@@ -73,6 +86,214 @@ def _effective_pipeline_depth(total_pages: int) -> int:
 def _build_vllm_health_url() -> str:
     parts = urlsplit(VLLM_URL)
     return urlunsplit((parts.scheme, parts.netloc, "/health", "", ""))
+
+
+def _clean_ocr_output(text: Optional[str]) -> str:
+    if not text:
+        return ""
+
+    cleaned = text.strip()
+    prompt_variants = [
+        OCR_EXTRACTION_PROMPT,
+        f'"{OCR_EXTRACTION_PROMPT}"',
+        f"'{OCR_EXTRACTION_PROMPT}'",
+    ]
+
+    for prompt_variant in prompt_variants:
+        if cleaned.startswith(prompt_variant):
+            cleaned = cleaned[len(prompt_variant):].lstrip("\n\r :-\t")
+
+    return cleaned
+
+
+def _build_text_mask(pil_image: Image.Image) -> np.ndarray:
+    gray = np.array(pil_image.convert("L"))
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    return mask
+
+
+def _smooth_projection(values: np.ndarray, window: int) -> np.ndarray:
+    if window <= 1:
+        return values.astype(np.float32)
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(values.astype(np.float32), kernel, mode="same")
+
+
+def _projection_signal_strength(values: np.ndarray) -> float:
+    smoothed = _smooth_projection(values, max(5, len(values) // 80))
+    mean_value = float(np.mean(smoothed))
+    if mean_value <= 1e-6:
+        return 0.0
+    return float(np.std(smoothed) / mean_value)
+
+
+def _text_density(mask: np.ndarray) -> float:
+    return float(np.mean(mask > 0))
+
+
+def _ink_center_y(mask: np.ndarray) -> float:
+    row_weights = (mask > 0).sum(axis=1).astype(np.float32)
+    total = float(row_weights.sum())
+    if total <= 1e-6:
+        return 0.5
+    positions = np.arange(mask.shape[0], dtype=np.float32)
+    return float(np.dot(row_weights, positions) / total / max(1, mask.shape[0] - 1))
+
+
+def _detect_vertical_separator(pil_image: Image.Image, mask: np.ndarray, split_x: int) -> tuple[bool, int]:
+    width = mask.shape[1]
+    separator_half = max(3, int(width * OCR_SEPARATOR_BAND_RATIO / 2.0))
+    neighbor_width = max(separator_half + 2, int(width * OCR_SEPARATOR_NEIGHBOR_BAND_RATIO))
+
+    separator_start = max(0, split_x - separator_half)
+    separator_end = min(width, split_x + separator_half + 1)
+    left_start = max(0, separator_start - neighbor_width)
+    left_end = separator_start
+    right_start = separator_end
+    right_end = min(width, separator_end + neighbor_width)
+
+    if separator_end - separator_start < 3 or left_end - left_start < 3 or right_end - right_start < 3:
+        return False, split_x
+
+    separator_mask = mask[:, separator_start:separator_end]
+    left_mask = mask[:, left_start:left_end]
+    right_mask = mask[:, right_start:right_end]
+
+    separator_density = _text_density(separator_mask)
+    left_density = _text_density(left_mask)
+    right_density = _text_density(right_mask)
+    neighbor_density = min(left_density, right_density)
+
+    if neighbor_density <= 1e-6:
+        return False, split_x
+
+    gray = np.array(pil_image.convert("L"), dtype=np.float32)
+    horizontal_gradient = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+    separator_texture = float(np.mean(horizontal_gradient[:, separator_start:separator_end]))
+    left_texture = float(np.mean(horizontal_gradient[:, left_start:left_end]))
+    right_texture = float(np.mean(horizontal_gradient[:, right_start:right_end]))
+    neighbor_texture = min(left_texture, right_texture)
+
+    density_ratio = separator_density / neighbor_density
+    texture_ratio = separator_texture / max(neighbor_texture, 1e-6)
+
+    if density_ratio >= OCR_SEPARATOR_DENSITY_RATIO:
+        return False, split_x
+    if neighbor_texture > 1e-6 and texture_ratio >= OCR_SEPARATOR_TEXTURE_RATIO:
+        return False, split_x
+
+    column_density = np.mean(separator_mask > 0, axis=0)
+    low_density_columns = np.where(column_density <= min(0.08, neighbor_density * OCR_SEPARATOR_DENSITY_RATIO))[0]
+    if low_density_columns.size > 0:
+        refined_x = separator_start + int(round(float(np.mean(low_density_columns))))
+        return True, refined_x
+
+    refined_x = separator_start + (separator_end - separator_start) // 2
+    return True, refined_x
+
+
+def _is_sideways_page(pil_image: Image.Image) -> bool:
+    mask = _build_text_mask(pil_image)
+    if _text_density(mask) < OCR_TEXT_MIN_DENSITY:
+        return False
+
+    row_signal = _projection_signal_strength(mask.sum(axis=1))
+    col_signal = _projection_signal_strength(mask.sum(axis=0))
+    return col_signal > row_signal * OCR_SIDEWAYS_PROJECTION_RATIO
+
+
+def _normalize_sideways_page(pil_image: Image.Image) -> tuple[Image.Image, bool]:
+    working_image = pil_image.copy()
+    if not _is_sideways_page(working_image):
+        return working_image, False
+
+    clockwise = working_image.rotate(-90, expand=True)
+    counter_clockwise = working_image.rotate(90, expand=True)
+
+    clockwise_center = _ink_center_y(_build_text_mask(clockwise))
+    counter_center = _ink_center_y(_build_text_mask(counter_clockwise))
+
+    working_image.close()
+    if clockwise_center <= counter_center:
+        counter_clockwise.close()
+        return clockwise, True
+
+    clockwise.close()
+    return counter_clockwise, True
+
+
+def _detect_two_page_spread(pil_image: Image.Image) -> tuple[bool, Optional[int]]:
+    width, _ = pil_image.size
+
+    mask = _build_text_mask(pil_image)
+    if _text_density(mask) < OCR_TEXT_MIN_DENSITY:
+        return False, None
+
+    half_width = width // 2
+    left_density = _text_density(mask[:, :half_width])
+    right_density = _text_density(mask[:, half_width:])
+    if left_density < OCR_TEXT_MIN_DENSITY or right_density < OCR_TEXT_MIN_DENSITY:
+        return False, None
+
+    projection = mask.sum(axis=0).astype(np.float32)
+    smooth_window = max(21, (width // 40) | 1)
+    smoothed = _smooth_projection(projection, smooth_window)
+
+    center_band_half = max(10, int(width * OCR_SPREAD_CENTER_BAND_RATIO / 2.0))
+    center_start = max(0, half_width - center_band_half)
+    center_end = min(width, half_width + center_band_half)
+    center_band = smoothed[center_start:center_end]
+    if center_band.size == 0:
+        return False, None
+
+    left_band = smoothed[int(width * 0.08): max(int(width * 0.45), int(width * 0.08) + 1)]
+    right_band = smoothed[min(int(width * 0.55), width - 1): int(width * 0.92)]
+    if left_band.size == 0 or right_band.size == 0:
+        return False, None
+
+    valley_index = center_start + int(np.argmin(center_band))
+    valley_value = float(smoothed[valley_index])
+    left_level = float(np.mean(left_band))
+    right_level = float(np.mean(right_band))
+    shoulder_level = min(left_level, right_level)
+
+    if shoulder_level <= 1e-6:
+        return False, None
+
+    balance = abs(left_level - right_level) / max(left_level, right_level)
+    center_ratio = valley_value / shoulder_level
+
+    if center_ratio < 0.72 and balance < 0.6:
+        has_separator, refined_split_x = _detect_vertical_separator(pil_image, mask, valley_index)
+        if has_separator:
+            return True, refined_split_x
+
+    return False, None
+
+
+def _split_two_page_spread(pil_image: Image.Image, split_x: int) -> List[Image.Image]:
+    width, height = pil_image.size
+    gap = max(2, int(width * OCR_SPLIT_GAP_RATIO))
+    left_end = max(1, min(width - 1, split_x - gap))
+    right_start = max(1, min(width - 1, split_x + gap))
+
+    left_page = pil_image.crop((0, 0, left_end, height)).copy()
+    right_page = pil_image.crop((right_start, 0, width, height)).copy()
+    return [left_page, right_page]
+
+
+def _prepare_page_images(pil_image: Image.Image) -> tuple[List[Image.Image], Dict[str, Any]]:
+    working_image = pil_image.copy()
+    rotated = False
+    is_spread, split_x = _detect_two_page_spread(working_image)
+
+    if is_spread and split_x is not None:
+        split_images = _split_two_page_spread(working_image, split_x)
+        working_image.close()
+        return split_images, {"rotated": rotated, "spread": True, "split_x": split_x}
+
+    return [working_image], {"rotated": rotated, "spread": False, "split_x": None}
 
 
 async def _wait_for_vllm_ready() -> None:
@@ -256,29 +477,38 @@ async def _ocr_image_bytes_to_pages(content: bytes) -> List[Dict[str, Any]]:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
-    b64_image = preprocess_image_for_ocr(image)
-    image.close()
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "OCR this page. Output only text."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
-                ],
-            }
-        ],
-        "max_tokens": OCR_MAX_TOKENS,
-    }
-
     timeout = _build_client_timeout()
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        result = await _post_to_vllm(session, payload)
+        prepared_images, metadata = _prepare_page_images(image)
+        image.close()
+        pages: List[Dict[str, Any]] = []
 
-    text = (result.get("choices") or [{}])[0].get("message", {}).get("content")
-    return [{"index": 0, "markdown": text or ""}]
+        if metadata["spread"]:
+            logger.info("Detected two-page spread in image upload; splitting at x=%s", metadata["split_x"])
+
+        for index, prepared_image in enumerate(prepared_images):
+            try:
+                b64_image = preprocess_image_for_ocr(prepared_image)
+                payload = {
+                    "model": MODEL_NAME,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": OCR_EXTRACTION_PROMPT},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}},
+                            ],
+                        }
+                    ],
+                    "max_tokens": OCR_MAX_TOKENS,
+                }
+                result = await _post_to_vllm(session, payload)
+                text = (result.get("choices") or [{}])[0].get("message", {}).get("content")
+                pages.append({"index": index, "markdown": _clean_ocr_output(text)})
+            finally:
+                prepared_image.close()
+
+    return pages
 
 
 @app.post("/v1/files")
@@ -412,27 +642,42 @@ async def process_single_page(session, semaphore, img_path, page_num):
         try:
             prep_start = time.time()
             with Image.open(img_path) as img:
-                b64_image = preprocess_image_for_ocr(img)
-            print(f'[Page {page_num}] Image preprocessing took {time.time()-prep_start:.2f}s', flush=True)
+                prepared_images, metadata = _prepare_page_images(img.convert("RGB"))
 
-            payload = {
-                "model": MODEL_NAME,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "OCR this page. Output only text."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-                    ]
-                }],
-                "max_tokens": OCR_MAX_TOKENS
-            }
+            print(f'[Page {page_num}] Image preprocessing took {time.time()-prep_start:.2f}s', flush=True)
+            if metadata["spread"]:
+                print(f'[Page {page_num}] ⇆ Detected two-page spread, splitting at x={metadata["split_x"]}', flush=True)
 
             req_start = time.time()
-            result = await _post_to_vllm(session, payload)
+            segment_texts: List[str] = []
+            for segment_index, prepared_image in enumerate(prepared_images, start=1):
+                try:
+                    b64_image = preprocess_image_for_ocr(prepared_image)
+                    payload = {
+                        "model": MODEL_NAME,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": OCR_EXTRACTION_PROMPT},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                            ]
+                        }],
+                        "max_tokens": OCR_MAX_TOKENS
+                    }
+                    result = await _post_to_vllm(session, payload)
+                    segment_text = _clean_ocr_output(
+                        (result.get("choices") or [{}])[0].get("message", {}).get("content")
+                    )
+                    segment_texts.append(segment_text)
+                    if metadata["spread"]:
+                        print(f'[Page {page_num}] Segment {segment_index}/{len(prepared_images)} OCR complete', flush=True)
+                finally:
+                    prepared_image.close()
+
             elapsed = time.time() - start
             req_time = time.time() - req_start
             print(f'[Page {page_num}] ✓ OCR request took {req_time:.2f}s, total OCR: {elapsed:.2f}s', flush=True)
-            return (page_num, result['choices'][0]['message']['content'])
+            return (page_num, "\n\n".join([text for text in segment_texts if text.strip()]))
         except Exception as e:
             elapsed = time.time() - start
             print(f'[Page {page_num}] ✗ Exception after {elapsed:.2f}s: {str(e)}', flush=True)
