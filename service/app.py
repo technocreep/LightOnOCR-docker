@@ -37,10 +37,11 @@ OCR_EXTRACTION_PROMPT = (
     "contents. Output only extracted text."
 )
 
-PDF_DPI = max(220, int(os.getenv("PDF_DPI", "144")))
+PDF_DPI = max(70, int(os.getenv("PDF_DPI", "144")))
 SAVE_QUALITY = max(95, min(95, int(os.getenv("SAVE_QUALITY", "80"))))
-OCR_MAX_TOKENS = max(7000, int(os.getenv("OCR_MAX_TOKENS", "1024")))
+OCR_MAX_TOKENS = max(1024, int(os.getenv("OCR_MAX_TOKENS", "1024")))
 OCR_PROCESSING_MODE = os.getenv("OCR_PROCESSING_MODE", "sequential").strip().lower()
+MAX_CONCURRENT_DOCUMENTS = max(1, int(os.getenv("MAX_CONCURRENT_DOCUMENTS", "1")))
 MAX_CONCURRENT_REQUESTS = max(1, int(os.getenv("MAX_CONCURRENT_REQUESTS", "1")))
 OCR_CONVERT_WORKERS = max(1, int(os.getenv("OCR_CONVERT_WORKERS", "1")))
 OCR_PAGE_PIPELINE_DEPTH = max(
@@ -64,6 +65,16 @@ VLLM_STARTUP_MAX_WAIT_SECONDS = float(os.getenv("VLLM_STARTUP_MAX_WAIT_SECONDS",
 VLLM_HEALTHCHECK_TIMEOUT_SECONDS = float(os.getenv("VLLM_HEALTHCHECK_TIMEOUT_SECONDS", "10"))
 
 executor = ThreadPoolExecutor(max_workers=OCR_CONVERT_WORKERS)
+_document_processing_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_document_processing_semaphore() -> asyncio.Semaphore:
+    global _document_processing_semaphore
+
+    if _document_processing_semaphore is None:
+        _document_processing_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOCUMENTS)
+
+    return _document_processing_semaphore
 
 
 def _build_client_timeout() -> aiohttp.ClientTimeout:
@@ -585,16 +596,19 @@ async def v1_ocr(
     content_type = meta.get("content_type") or "application/octet-stream"
 
     t0 = time.time()
-    if _is_pdf(filename, content_type):
-        try:
-            reader = PdfReader(io.BytesIO(content))
-            total_pages = len(reader.pages)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
+    async with _get_document_processing_semaphore():
+        logger.info("Starting OCR document %s (document slots: %s)", file_id, MAX_CONCURRENT_DOCUMENTS)
 
-        pages = await _ocr_pdf_bytes_to_pages(content, doc_name=file_id, total_pages=total_pages)
-    else:
-        pages = await _ocr_image_bytes_to_pages(content)
+        if _is_pdf(filename, content_type):
+            try:
+                reader = PdfReader(io.BytesIO(content))
+                total_pages = len(reader.pages)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid PDF: {e}")
+
+            pages = await _ocr_pdf_bytes_to_pages(content, doc_name=file_id, total_pages=total_pages)
+        else:
+            pages = await _ocr_image_bytes_to_pages(content)
 
     return JSONResponse(
         content={
@@ -742,16 +756,17 @@ async def ocr_pdf(file: UploadFile = File(...)):
 
     timeout = _build_client_timeout()
 
-    tasks_start = time.time()
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        mode_name = "bounded sequential" if _use_sequential_processing() else f"bounded parallel ({MAX_CONCURRENT_REQUESTS})"
-        print(
-            f'⚡ Starting {mode_name} processing for {total_pages} pages with pipeline depth {_effective_pipeline_depth(total_pages)}...\n',
-            flush=True,
-        )
-        gather_start = time.time()
-        results = await _run_pdf_page_pipeline(session, content, target_dir, total_pages)
-        gather_time = time.time() - gather_start
+    async with _get_document_processing_semaphore():
+        print(f'🗂️ Document concurrency limit: {MAX_CONCURRENT_DOCUMENTS}', flush=True)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            mode_name = "bounded sequential" if _use_sequential_processing() else f"bounded parallel ({MAX_CONCURRENT_REQUESTS})"
+            print(
+                f'⚡ Starting {mode_name} processing for {total_pages} pages with pipeline depth {_effective_pipeline_depth(total_pages)}...\n',
+                flush=True,
+            )
+            gather_start = time.time()
+            results = await _run_pdf_page_pipeline(session, content, target_dir, total_pages)
+            gather_time = time.time() - gather_start
 
     results.sort(key=lambda x: x[0])
     full_text = "\n\n--- Page Break ---\n\n".join([text for _, text in results])
@@ -772,6 +787,8 @@ async def ocr_pdf(file: UploadFile = File(...)):
 
 @app.on_event("startup")
 async def startup_event():
+    _get_document_processing_semaphore()
+    logger.info("Document concurrency limit configured: %s", MAX_CONCURRENT_DOCUMENTS)
     await _wait_for_vllm_ready()
 
 @app.on_event("shutdown")

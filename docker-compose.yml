@@ -7,6 +7,7 @@ services:
     environment:
       - CUDA_VISIBLE_DEVICES=0
       - HF_TOKEN=${HF_TOKEN}
+      - VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1
     ports:
       - "8508:8099"
     volumes:
@@ -43,11 +44,12 @@ services:
       - VLLM_URL=http://vllm-server:8099/v1/chat/completions
       - PDF_DPI=144
       - SAVE_QUALITY=80
-      - OCR_MAX_TOKENS=1024
-      - OCR_PROCESSING_MODE=sequential
-      - MAX_CONCURRENT_REQUESTS=1
+      - OCR_MAX_TOKENS=7000
+      - MAX_CONCURRENT_DOCUMENTS=1
+      - OCR_PROCESSING_MODE=parallel
+      - MAX_CONCURRENT_REQUESTS=5
       - OCR_CONVERT_WORKERS=2
-      - OCR_PAGE_PIPELINE_DEPTH=3
+      - OCR_PAGE_PIPELINE_DEPTH=5
       - OCR_MODEL_CONNECT_TIMEOUT_SECONDS=300
       - OCR_MODEL_READ_TIMEOUT_SECONDS=21600
       - OCR_MODEL_TOTAL_TIMEOUT_SECONDS=21600
